@@ -3,19 +3,43 @@ from torch import nn
 import torch.nn.functional as F
 
 
-class Permute(nn.Module):
+# id like to do a random chunk-wise rearrange... to sort of preserve part of the dot products.
 
-    def __init__(self, perm_indices):
+class PermuteIn(nn.Module):
+
+    def __init__(self, 
+                dim,
+                mode="random", # random, roll 
+                roll=0.4,
+                ):
         super().__init__()
-        self.register_buffer('permute', perm_indices.long())
+        roll = int(roll * dim)
+        if mode == "random":
+            permute = torch.randperm(dim)
+        else:
+            permute = torch.roll(torch.arange(dim), roll)
+        self.register_buffer("permute", permute)
 
     def forward(self, x):
         return x[:, self.permute]
 
 
+class Unpermute(nn.Module):
+
+    def __init__(self, indices):
+        super().__init__()
+        perm_matrix = F.one_hot(indices, num_classes=indices.shape[0]).float()
+        unperm_matrix = perm_matrix.inverse()
+        unperm = unperm_matrix.argmax(dim=-1).long()
+        self.register_buffer("unperm", unperm)
+
+    def forward(self, x):
+        return x[:, self.unperm]
+
+
 class SparseFeedForward(nn.Module):
 
-    def __init__(self, dim=64, heads=8, act=nn.GELU, mlp_dim=256, unperm=True, residual=False, dropout=0.):
+    def __init__(self, dim=64, heads=8, act=nn.GELU, mlp_dim=256, perm=True, unperm=True, residual=False, dropout=0.):
         super().__init__()
         self.d = dim
         self.h = heads
@@ -26,15 +50,15 @@ class SparseFeedForward(nn.Module):
         self.down = nn.Parameter(torch.randn(heads, mlp_dim, dim))
         self.act = act()
 
-        permute = torch.randperm(heads * dim)
-        self.perm = Permute(permute)
-        if unperm:
-            perm_matrix = F.one_hot(permute, num_classes=heads * dim).float()
-            unperm_matrix = perm_matrix.inverse()
-            unperm = unperm_matrix.argmax(dim=-1).long()
-            self.unperm = Permute(unperm)
+        self.unperm = nn.Identity()
+        if perm:
+            self.perm = PermuteIn(dim * heads)
+            if unperm:
+                self.unperm = Unpermute(self.perm.permute)
         else:
-            self.unperm = nn.Identity()
+            self.perm = nn.Linear(dim * heads, dim * heads)
+            if unperm:
+                self.unperm = nn.Linear(dim * heads, dim * heads)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -112,13 +136,9 @@ class SparseMLP(nn.Module):
 
         self.unperm = nn.Identity()
         if perm:
-            permute = torch.randperm(heads * dim)
-            self.perm = Permute(permute)
+            self.perm = PermuteIn(dim * heads)
             if unperm:
-                perm_matrix = F.one_hot(permute, num_classes=heads * dim).float()
-                unperm_matrix = perm_matrix.inverse()
-                unperm = unperm_matrix.argmax(dim=-1).long()
-                self.unperm = Permute(unperm)
+                self.unperm = Unpermute(self.perm.permute)
         else:
             self.perm = nn.Linear(dim * heads, dim * heads)
             if unperm:
