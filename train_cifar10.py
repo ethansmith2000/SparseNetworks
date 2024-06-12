@@ -34,7 +34,7 @@ args = dict(
     opt = "adam",
     resume = False,
     aug = True,
-    mp_dtype = "bfloat16",
+    mp_dtype = "bf16",
     wandb = True,
     mixup = True,
     net = "vit",
@@ -46,8 +46,8 @@ args = dict(
     convkernel = 8,
     num_classes=10,
 
-    sparse_heads=8,
-    mlp_dim = 512 * 8,
+    sparse_heads=1,
+    mlp_dim = 512,
     sparse=True,
     compile=False,
 )
@@ -105,7 +105,7 @@ if args.wandb:
     
 for epoch in range(args.start_epoch, args.n_epochs):
     start = time.time()
-    trainloss = train(args, epoch, net, net_forward, trainloader, optimizer, scaler)
+    trainloss = train(args, epoch, net, net_forward, trainloader, optimizer, scaler, loss_fn=loss_fn)
     val_loss, acc = test(args, epoch, net, net_forward, testloader, optimizer, scaler)
     
     scheduler.step(epoch-1) # step cosine scheduling

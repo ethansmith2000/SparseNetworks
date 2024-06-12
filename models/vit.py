@@ -70,7 +70,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([])
         for _ in range(depth):
-            mlp = SparseFeedForward(dim//sparse_heads, sparse_heads, act=nn.GELU, mlp_dim=mlp_dim//sparse_heads, unperm=True,) if sparse else FeedForward(dim, mlp_dim, dropout)
+            mlp = SparseFeedForward(full_dim=dim, heads=sparse_heads, full_mlp_dim=mlp_dim) if sparse else FeedForward(dim, mlp_dim, dropout)
             self.layers.append(nn.ModuleList([
                 PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
                 PreNorm(dim, mlp)

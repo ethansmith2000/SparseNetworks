@@ -304,10 +304,15 @@ def train(args, epoch, net, net_forward, trainloader, optimizer, scaler, loss_fn
     train_loss = 0
     correct = 0
     total = 0
+    mp_dtype = torch.float32
+    if args.mp_dtype=="bf16":
+        mp_dtype = torch.bfloat16
+    elif args.mp_dtype=="fp16":
+        mp_dtype = torch.float16
     for batch_idx, (inputs, targets) in enumerate(trainloader):
         inputs, targets = inputs.to(args.device), targets.to(args.device)
         # Train with amp
-        with torch.cuda.amp.autocast(enabled=args.amp):
+        with torch.cuda.amp.autocast(enabled=args.mp_dtype!="fp32", dtype=mp_dtype):
             loss, preds = loss_fn(net_forward, inputs, targets)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -346,12 +351,20 @@ def test(args, epoch, net, net_forward, testloader, optimizer, scaler):
                 % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
     
     # Save checkpoint.
-    print('Saving..')
-    state = {"model": net.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict()}
-    if not os.path.isdir('checkpoint'):
-        os.mkdir('checkpoint')
-    torch.save(state, './checkpoint/'+args.net+'-{}-ckpt.t7'.format(args.patch))
+    acc = 100.*correct/total
+    if acc > args.best_acc:
+        print('Saving..')
+        state = {"model": net.state_dict(),
+              "optimizer": optimizer.state_dict(),
+              "scaler": scaler.state_dict()}
+        if not os.path.isdir('checkpoint'):
+            os.mkdir('checkpoint')
+        torch.save(state, './checkpoint/'+args.net+'-{}-ckpt.t7'.format(args.patch))
+        args.best_acc = acc
     
+    os.makedirs("log", exist_ok=True)
+    content = time.ctime() + ' ' + f'Epoch {epoch}, lr: {optimizer.param_groups[0]["lr"]:.7f}, val loss: {test_loss:.5f}, acc: {(acc):.5f}'
+    print(content)
+    with open(f'log/log_{args.net}_patch{args.patch}.txt', 'a') as appender:
+        appender.write(content + "\n")
     return test_loss, acc
