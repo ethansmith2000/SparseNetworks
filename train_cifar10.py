@@ -46,8 +46,8 @@ args = dict(
     convkernel = 8,
     num_classes=10,
 
-    sparse_heads=1,
-    mlp_dim = 512,
+    sparse_heads=8,
+    mlp_dim = 512*8,
     sparse=True,
     compile=False,
 )

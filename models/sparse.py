@@ -60,7 +60,10 @@ class SparseLinear(nn.Module):
         self.in_dim = full_in_dim // heads
         self.out_dim = full_out_dim // heads
         self.h = heads
-        self.weight = nn.Parameter(torch.randn(heads, self.in_dim, self.out_dim))
+        weights = [torch.randn(self.in_dim, self.out_dim) for _ in range(heads)]
+        for i in range(len(weights)):
+            torch.nn.init.xavier_uniform_(weights[i])
+        self.weight = nn.Parameter(torch.stack(weights, dim=0))
         self.bias_add = BiasAdd(self.full_out) if bias else nn.Identity()
 
     def forward(self, x):
@@ -79,7 +82,7 @@ class SparseMLP(nn.Module):
                         heads=8, 
                         act=nn.GELU, 
                         full_mlp_dim=4096, 
-                        unperm=False, 
+                        unperm=True, 
                         dropout=0., 
                         permute_mode="chunk_random", # ["random", "roll", "chunk_random", "linear"]
                         ):
