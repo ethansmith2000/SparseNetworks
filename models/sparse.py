@@ -7,7 +7,7 @@ class PermuteIn(nn.Module):
     def __init__(self, 
                 full_dim,
                 heads,
-                mode="random", # random, roll, chunk_random
+                mode="chunk_random", # random, roll, chunk_random
                 roll=0.4,
                 chunks=4, # must divide the chunk dim evenly
                 ):
@@ -62,7 +62,7 @@ class SparseLinear(nn.Module):
         self.h = heads
         weights = [torch.randn(self.in_dim, self.out_dim) for _ in range(heads)]
         for i in range(len(weights)):
-            torch.nn.init.xavier_uniform_(weights[i])
+            torch.nn.init.xavier_uniform_(weights[i], gain=torch.nn.init.calculate_gain('relu'))
         self.weight = nn.Parameter(torch.stack(weights, dim=0))
         self.bias_add = BiasAdd(self.full_out) if bias else nn.Identity()
 
