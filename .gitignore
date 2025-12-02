@@ -3,3 +3,4 @@ data
 wandb
 checkpoint
 __pycache__
+model-output

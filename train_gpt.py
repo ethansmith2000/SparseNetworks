@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import random
+from contextlib import nullcontext
 from itertools import chain
 from pathlib import Path
 
@@ -52,7 +53,7 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version, send_example_telemetry
+from transformers.utils import check_min_version
 from types import SimpleNamespace
 
 import torch
@@ -61,86 +62,21 @@ from typing import Optional, Tuple, Union
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 import time
 
-from models.sparse import SparseLinear, PermuteIn, Unpermute
-
-
-class Conv1D(nn.Module):
-    """
-    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
-
-    Basically works like a linear layer but the weights are transposed.
-
-    Args:
-        nf (`int`): The number of output features.
-        nx (`int`): The number of input features.
-    """
-
-    def __init__(self, nf, nx):
-        super().__init__()
-        self.nf = nf
-        self.weight = nn.Parameter(torch.empty(nx, nf))
-        self.bias = nn.Parameter(torch.zeros(nf))
-        nn.init.normal_(self.weight, std=0.02)
-
-    def forward(self, x):
-        size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
-        x = x.view(size_out)
-        return x
-
-
-class GPT2MLP(nn.Module):
-    def __init__(self, hid_size, mlp_dim, resid_pdrop):
-        super().__init__()
-        self.c_fc = Conv1D(mlp_dim, hid_size)
-        self.c_proj = Conv1D(hid_size, mlp_dim)
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(resid_pdrop)
-
-    def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
-
-
-class GPT2MLPSparse(nn.Module):
-    def __init__(self, hid_size, mlp_dim, resid_pdrop, sparse_heads=8, permute_mode=None, unpermute=True):
-        super().__init__()
-        self.c_fc = SparseLinear(hid_size, mlp_dim)
-        self.c_proj = SparseLinear(mlp_dim, hid_size)
-        self.permute = PermuteIn(hid_size, sparse_heads, mode=permute_mode) if permute_mode is not None else nn.Identity()
-        self.unpermute = Unpermute(self.permute.permute) if (unpermute and permute_mode is not None) else nn.Identity()
-        self.act = nn.GELU()
-        self.dropout = nn.Dropout(resid_pdrop)
-
-    def forward(self, hidden_states: Optional[Tuple[torch.FloatTensor]]) -> torch.FloatTensor:
-        b, toks, d = hidden_states.shape
-        hidden_states = hidden_states.reshape(b * toks, d)
-        hidden_states = self.permute(hidden_states)
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.unpermute(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = hidden_states.reshape(b, toks, d)
-        return hidden_states
+from models.sparse import SparseLinear
+from gptmodel import GPTConfig, GPT
+from param_tracker import ParameterTracker
 
 
 
-def patch_mlp(model, arguments):
+def patch_gpt(model, config):
     for n,m in model.named_modules():
         if hasattr(m, "mlp"):
-            del m.mlp
-            if arguments.sparse:
-                m.add_module("mlp", GPT2MLPSparse(model.config.hidden_size, arguments.mlp_dim, model.config.resid_pdrop, arguments.sparse_heads, arguments.permute_mode, arguments.unpermute))
-            else:
-                m.add_module("mlp", GPT2MLP(model.config.hidden_size, arguments.mlp_dim, model.config.resid_pdrop))
+            m.mlp.c_fc = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*4, **config.sparse_kwargs_up, bias=False)
+            m.mlp.c_proj = SparseLinear(full_in_dim=config.hidden_size*4, full_out_dim=config.hidden_size, **config.sparse_kwargs_down, bias=False)
+        if hasattr(m, "attn"):
+            m.attn.c_attn = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*3, **config.sparse_kwargs_qkv, bias=False)
+            m.attn.c_proj = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size, **config.sparse_kwargs_out, bias=False)
 
-
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-# check_min_version("4.39.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -149,16 +85,35 @@ logger = get_logger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.v8_api_enabled = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True # 
+torch.backends.cuda.allow_tensor_float_32 = True
+
+import torch._dynamo as dynamo
+dynamo.config.verbose = False
+dynamo.config.suppress_errors = True
+dynamo.config.assume_static_by_default = True  # if shapes rarely change
+dynamo.config.cache_size_limit = 64  # limit graph cache to avoid recompiles
+dynamo.config.guard_nn_modules = True  # avoids excess guards
+
+import torch._inductor as inductor
+inductor.config.triton.cudagraphs = True   # or False if capture causes overhead
+inductor.config.max_autotune = False       # skip exhaustive autotune when compile time matters
+inductor.config.use_mixed_mm = True        # enables faster matmul codegen
+
+
+# torch.set_num_threads(n)
+# torch.set_num_interop_threads(m)
+
 
 def main():
 
     args = {
-        "sparse": True,
-        "sparse_heads": 8,
-        "mlp_dim": 3072 * 8,
-        "permute_mode": None,
-        # "permute_mode": "chunk_random",
-        "unpermute": True,
         "num_validation_batches": 25,
         "validate_every": 1000,
         "dataset_name": "wikitext",
@@ -166,13 +121,13 @@ def main():
         "train_file": None,
         "validation_file": None,
         "validation_split_percentage": 5,
-        # "model_name_or_path": "openai-community/gpt2-medium",
-        "model_name_or_path": "openai-community/gpt2",
+        "model_name_or_path": "openai-community/gpt2-medium",
+        # "model_name_or_path": "openai-community/gpt2",
         "config_name": None,
         "tokenizer_name": None,
         "use_slow_tokenizer": False,
-        "per_device_train_batch_size": 28,
-        "learning_rate": 5.0e-5,
+        "per_device_train_batch_size": 24,
+        "learning_rate": 7.0e-5,
         "weight_decay": 0.01,
         "num_train_epochs": 2,
         "max_train_steps": None,
@@ -181,7 +136,7 @@ def main():
         "num_warmup_steps": 250,
         "seed": 123,
         "model_type": None,
-        "block_size": None,
+        "block_size": 1024,
         "preprocessing_num_workers": 10,
         "overwrite_cache": False,
         "no_keep_linebreaks": False,
@@ -194,29 +149,97 @@ def main():
         "max_grad_norm": 1.0,
         "hf_path": None,
         "base_output_dir": "model-output",
+
+        "hidden_size": 1024,
+        "depth": 12,
+        "n_head": 8,
+
+        "beta1": 0.9,
+        "beta2": 0.98,
+
+        "compile": True,
+        "compile_mode": "reduce-overhead",
+        "compile_fullgraph": True,
+
+        "gradient_checkpointing": True,
+
+        "num_workers": 12,
+        "enable_sparse_lr_multiplier": True,
+        "use_sparse_block_gain": True,
+
+        "log_params_every_n": 100,
+        "activation_sample_limit": 2,
+        "activation_capture": "both",
+        "activation_param_blacklist": ["bias", "gate"],
+        "activation_clear_cuda_cache": True,
+        "activation_force_python_gc": False,
+
+        "sparse": False,
+        "sparse_kwargs_up":dict(
+            sparse_heads=8, 
+            # permute_in_mode="lora", 
+            permute_in_mode=None,
+            rank_in=64, 
+            permute_out_mode="lora", 
+            # permute_out_mode=None,
+            rank_out=64, 
+            init_mode="per_block_xavier"
+            # init_mode="global_xavier"
+            ),
+        "sparse_kwargs_down":dict(
+            sparse_heads=8, 
+            # permute_in_mode="lora", 
+            permute_in_mode=None,
+            rank_in=64, 
+            permute_out_mode="lora", 
+            rank_out=64, 
+            init_mode="per_block_xavier"
+            # init_mode="global_xavier"
+            ),
+        "sparse_kwargs_qkv":dict(
+            sparse_heads=8, 
+            permute_in_mode="lora", 
+            rank_in=64, 
+            permute_out_mode="lora", 
+            # permute_out_mode=None,
+            rank_out=64, 
+            init_mode="per_block_xavier"
+            # init_mode="global_xavier"
+            ),
+        "sparse_kwargs_out":dict(
+            sparse_heads=8, 
+            # permute_in_mode="lora", 
+            permute_in_mode=None,
+            rank_in=64, 
+            permute_out_mode="lora", 
+            # permute_out_mode=None,
+            rank_out=64, 
+            init_mode="per_block_xavier"
+            # init_mode="global_xavier"
+            ),
     }
+
+    for key in ("sparse_kwargs_up", "sparse_kwargs_down", "sparse_kwargs_qkv", "sparse_kwargs_out"):
+        args[key]["use_block_gain"] = args["use_sparse_block_gain"]
 
     config = AutoConfig.from_pretrained(
         args['model_name_or_path'],
         trust_remote_code=args['trust_remote_code'],
     )
+    config.attn_pdrop=0.0
+    config.resid_pdrop=0.0
+    config.embd_pdrop=0.0
+    config.n_embd = args['hidden_size']
+    config.n_layer = args['depth']
+    config.n_head = args['n_head']
 
-    if args["mlp_dim"] is None:
-        args["mlp_dim"] = config.hidden_size * 4
-
-    base_str = f"base_hid-{config.hidden_size}_mlp-{args['mlp_dim']}"
-    if args["sparse"] is not None:
-        base_str = f"{base_str}_sparse_{args['sparse_heads']}"
+    base_str = f"base_hid-{args['hidden_size']}"
     args["output_dir"] = f"{args['base_output_dir']}/{base_str}"
 
     args = SimpleNamespace(**args)
 
     print("Running with the following arguments:")
     print(json.dumps(vars(args), indent=2))
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_clm_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -231,8 +254,16 @@ def main():
         accelerator_log_kwargs["project_dir"] = args.output_dir
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, 
-                                                            mixed_precision="fp16",
+                                                            mixed_precision="bf16",
                                                             **accelerator_log_kwargs)
+
+    param_tracker = ParameterTracker(
+        activation_sample_limit=args.activation_sample_limit,
+        activation_capture=args.activation_capture,
+        activation_param_blacklist=args.activation_param_blacklist,
+        activation_clear_cuda_cache=args.activation_clear_cuda_cache,
+        activation_force_python_gc=args.activation_force_python_gc,
+    )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -313,18 +344,18 @@ def main():
                 **dataset_args,
             )
 
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.
-
-    # Load pretrained model and tokenizer
-    #
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-
-
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
     )
+    # gpt_conf = GPTConfig(
+    #     vocab_size=len(tokenizer),
+    #     n_layer=args.depth,
+    #     n_head=args.n_head,
+    #     n_embd=args.hidden_size,
+    #     block_size=args.block_size,
+    #     gradient_checkpointing=args.gradient_checkpointing,
+    # )
+    # model = GPT(gpt_conf)
 
     model = AutoModelForCausalLM.from_config(
         config,
@@ -337,15 +368,21 @@ def main():
 
     model.gradient_checkpointing_enable()
 
-    patch_mlp(model, args)
+    if args.sparse:
+        patch_gpt(model, args)
 
     print(model)
+
+
+    print("num parameters", sum(p.numel() for p in model.parameters()))
     model = model.to(accelerator.device)
+    activation_probe_model = model  # keep eager (uncompiled) reference for activation stats
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
-    embedding_size = model.get_input_embeddings().weight.shape[0]
+    embedding_size = model.transformer.wte.weight.shape[0]
     if len(tokenizer) > embedding_size:
+        print("resizing token embeddings", len(tokenizer), embedding_size)
         model.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
@@ -417,33 +454,31 @@ def main():
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size, num_workers=args.num_workers, pin_memory=True
     )
     eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
+        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size, num_workers=args.num_workers, pin_memory=True
     )
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
+    optimizer_grouped_parameters = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        lr_mult = getattr(param, "lr_mult", 1.0) if args.enable_sparse_lr_multiplier else 1.0
+        optimizer_grouped_parameters.append(
+            {
+                "params": [param],
+                "weight_decay": 0.0 if any(nd in name for nd in no_decay) else args.weight_decay,
+                "lr": args.learning_rate * lr_mult,
+            }
+        )
 
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, betas=(args.beta1, args.beta2), fused=True)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -461,14 +496,14 @@ def main():
         else args.max_train_steps * accelerator.num_processes,
     )
 
+    # compile
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode, fullgraph=args.compile_fullgraph)
+
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
-
-    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -511,6 +546,7 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
     starting_epoch = 0
+    
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -544,6 +580,24 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
+
+    # allocated and reserved memory
+    allocated_memory = torch.cuda.memory_allocated()
+    reserved_memory = torch.cuda.memory_reserved()
+    progress_bar.set_postfix(vram=f"{reserved_memory / (1024 ** 3):.2f} GB")
+
+    # Create CUDA events for timing
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    data_start = torch.cuda.Event(enable_timing=True)
+    data_end = torch.cuda.Event(enable_timing=True)
+    forward_start = torch.cuda.Event(enable_timing=True)
+    forward_end = torch.cuda.Event(enable_timing=True)
+    backward_start = torch.cuda.Event(enable_timing=True)
+    backward_end = torch.cuda.Event(enable_timing=True)
+    optimizer_start = torch.cuda.Event(enable_timing=True)
+    optimizer_end = torch.cuda.Event(enable_timing=True)
+
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
@@ -553,32 +607,88 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
-        for step, batch in enumerate(active_dataloader):
+        
+        dataloader_iter = iter(active_dataloader)
+        for step in range(len(active_dataloader)):
             model.train()
+            
+            # Time data loading
+            data_start.record()
+            batch = next(dataloader_iter)
+            data_end.record()
+            
             with accelerator.accumulate(model):
+                should_profile_stats = (completed_steps % args.log_params_every_n == 0)
+                
+                if should_profile_stats:
+                    activation_context = param_tracker.activation_capture_context(activation_probe_model)
+                    with torch.no_grad():
+                        with accelerator.autocast():
+                            with activation_context:
+                                _ = activation_probe_model(**batch)
+                    # garbage collect
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    
+                
+                # Time forward pass
+                forward_start.record()
+                # logits, loss = model(idx=batch["input_ids"], targets=batch["labels"])
                 outputs = model(**batch)
                 loss = outputs.loss
+                forward_end.record()
+                
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
+                
+                # Time backward pass
+                backward_start.record()
                 accelerator.backward(loss)
+                backward_end.record()
+                
+                # Synchronize to get accurate timings
+                torch.cuda.synchronize()
+                
+                # Calculate elapsed times in milliseconds
+                data_time = data_start.elapsed_time(data_end)
+                forward_time = forward_start.elapsed_time(forward_end)
+                backward_time = backward_start.elapsed_time(backward_end)
+                
                 # clip the gradients
                 mini_logs ={
                         "step_loss": loss.detach().float(),
                         "lr": lr_scheduler.get_last_lr()[0],
+                        "timer/data_load_ms": data_time,
+                        "timer/forward_ms": forward_time,
+                        "timer/backward_ms": backward_time,
                     }
+
+
+                if should_profile_stats:
+                    param_tracker.update(model, completed_steps)
+                    param_tracker.log_parameter_stats_to_wandb(accelerator, completed_steps)
+
                 if args.max_grad_norm is not None:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     mini_logs["grad_norm"] = grad_norm
+                
+                # Time optimizer step
+                optimizer_start.record()
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_end.record()
+                torch.cuda.synchronize()
+                
+                optimizer_time = optimizer_start.elapsed_time(optimizer_end)
+                mini_logs["timer/optimizer_ms"] = optimizer_time
                 
                 accelerator.log(
                         mini_logs,
                         step=completed_steps,
                     )
-
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -600,9 +710,10 @@ def main():
                 losses = []
                 for step, batch in enumerate(eval_dataloader):
                     with torch.no_grad():
+                        # logits, loss = model(idx=batch["input_ids"], targets=batch["labels"])
                         outputs = model(**batch)
+                        loss = outputs.loss
 
-                    loss = outputs.loss
                     losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_train_batch_size)))
                     if args.num_validation_batches is not None:
                         if step >= args.num_validation_batches:

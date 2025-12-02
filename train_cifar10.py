@@ -43,13 +43,16 @@ args = dict(
     n_epochs = 200,
     patch = 4,
     dim = 64,
-    convkernel = 8,
     num_classes=10,
 
-    sparse_heads=8,
-    mlp_dim = 512*8,
+    mlp_mult = 4,
     sparse=True,
     compile=False,
+
+    sparse_kwargs_up=dict(sparse_heads=4, permute_in_mode="lora", rank_in=16, permute_out_mode="lora", rank_out=16),
+    sparse_kwargs_down=dict(sparse_heads=4, permute_in_mode="lora", rank_in=16, permute_out_mode="lora", rank_out=16),
+    sparse_kwargs_qkv=dict(sparse_heads=4, permute_in_mode="lora", rank_in=16, permute_out_mode="lora", rank_out=16),
+    sparse_kwargs_out=dict(sparse_heads=4, permute_in_mode="lora", rank_in=16, permute_out_mode="lora", rank_out=16),
 )
 
 

@@ -6,7 +6,7 @@ from torch import nn
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from .sparse import SparseFeedForward
+from .sparse import SparseLinear
 
 # helpers
 
@@ -24,55 +24,78 @@ class PreNorm(nn.Module):
         return self.fn(self.norm(x), **kwargs)
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout = 0.):
+    def __init__(
+        self,
+        dim,
+        hidden_dim,
+        dropout=0.,
+        # sparse_heads=8,
+        # permute_in_mode="chunk_random",
+        # roll_in=0.4,
+        # chunks_in=4,
+        # rank_in=16,
+        # permute_out_mode="chunk_random",
+        # roll_out=0.4,
+        # chunks_out=4,
+        # rank_out=16
+        sparse_kwargs_up=None,
+        sparse_kwargs_down=None,
+    ):
         super().__init__()
+
+        if sparse_kwargs_up is None:
+            fc1 = nn.Linear(dim, hidden_dim)
+        else:
+            fc1 = SparseLinear(full_in_dim=dim, full_out_dim=hidden_dim, **sparse_kwargs_up)
+
+        if sparse_kwargs_down is None:
+            fc2 = nn.Linear(hidden_dim, dim)
+        else:
+            fc2 = SparseLinear(full_in_dim=hidden_dim, full_out_dim=dim, **sparse_kwargs_down)
+
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+            fc1,
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
+            fc2,
             nn.Dropout(dropout)
         )
+
     def forward(self, x):
         return self.net(x)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+    def __init__(self, dim, heads = 8, dropout = 0. , sparse_kwargs_qkv=None, sparse_kwargs_out=None):
         super().__init__()
-        inner_dim = dim_head *  heads
-        project_out = not (heads == 1 and dim_head == dim)
-
+        inner_dim = dim
         self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        self.attend = nn.Softmax(dim = -1)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False) if sparse_kwargs_qkv is None else SparseLinear(full_in_dim=dim, full_out_dim=inner_dim * 3, **sparse_kwargs_qkv)
         self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
+            nn.Linear(inner_dim, dim) if sparse_kwargs_out is None else SparseLinear(full_in_dim=inner_dim, full_out_dim=dim, **sparse_kwargs_out),
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
 
     def forward(self, x):
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
-        attn = self.attend(dots)
-
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        b, n, _ = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        # Convert qkv from [b, n, h*d] to [b, n, h, d]
+        q, k, v = [t.reshape(b, n, self.heads, -1).transpose(1, 2) for t in qkv]  # [b, h, n, d]
+        # Use PyTorch's scaled dot-product attention
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0 if not self.training else self.to_out[1].p if isinstance(self.to_out, nn.Sequential) else 0.0
+        )
+        # out: [b, h, n, d] -> [b, n, h*d]
+        out = out.transpose(1, 2).reshape(b, n, -1)
         return self.to_out(out)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., sparse_heads=8, sparse=False):
+    def __init__(self, dim, depth, heads, mlp_dim, dropout = 0., sparse_kwargs_up=None, sparse_kwargs_down=None, sparse_kwargs_qkv=None, sparse_kwargs_out=None):
         super().__init__()
         self.layers = nn.ModuleList([])
         for _ in range(depth):
-            mlp = SparseFeedForward(full_dim=dim, heads=sparse_heads, full_mlp_dim=mlp_dim, dropout=dropout) if sparse else FeedForward(dim, mlp_dim, dropout)
+            mlp = FeedForward(dim, mlp_dim, dropout, sparse_kwargs_up=sparse_kwargs_up, sparse_kwargs_down=sparse_kwargs_down)
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout, sparse_kwargs_qkv=sparse_kwargs_qkv, sparse_kwargs_out=sparse_kwargs_out)),
                 PreNorm(dim, mlp)
             ]))
     def forward(self, x):
@@ -89,15 +112,15 @@ class ViT(nn.Module):
                     dim, 
                     depth, 
                     heads, 
-                    mlp_dim, 
+                    mlp_mult, 
                     pool = 'cls', 
                     channels = 3, 
-                    dim_head = 64, 
                     dropout = 0., 
                     emb_dropout = 0.,
-                    sparse_heads=8,
-                    sparse=False
-
+                    sparse_kwargs_up=None,
+                    sparse_kwargs_down=None,
+                    sparse_kwargs_qkv=None,
+                    sparse_kwargs_out=None,
                     ):
         super().__init__()
         image_height, image_width = pair(image_size)
@@ -118,7 +141,8 @@ class ViT(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.dropout = nn.Dropout(emb_dropout)
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout, sparse_heads=sparse_heads, sparse=sparse)
+        mlp_dim = dim * mlp_mult
+        self.transformer = Transformer(dim, depth, heads, mlp_dim, dropout, sparse_kwargs_up=sparse_kwargs_up, sparse_kwargs_down=sparse_kwargs_down, sparse_kwargs_qkv=sparse_kwargs_qkv, sparse_kwargs_out=sparse_kwargs_out)
 
         self.pool = pool
         self.to_latent = nn.Identity()

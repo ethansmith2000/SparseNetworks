@@ -84,6 +84,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
+    gradient_checkpointing: bool = False
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
@@ -149,7 +150,10 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            if self.config.gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False, preserve_rng_state=False, determinism_check='none', early_stop=True)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

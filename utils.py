@@ -208,12 +208,13 @@ def load_model(args):
         dim = int(args.dim),
         depth = 6,
         heads = 8,
-        mlp_dim = args.mlp_dim,
+        mlp_mult = args.mlp_mult,
         dropout = 0.1,
         emb_dropout = 0.1,
-        sparse_heads=args.sparse_heads,
-        sparse=args.sparse
-
+        sparse_kwargs_up=args.sparse_kwargs_up,
+        sparse_kwargs_down=args.sparse_kwargs_down,
+        sparse_kwargs_qkv=args.sparse_kwargs_qkv,
+        sparse_kwargs_out=args.sparse_kwargs_out
     )
     elif args.net=="vit_timm":
         import timm
