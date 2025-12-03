@@ -22,7 +22,43 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
+import torch
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.v8_api_enabled = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True # 
+torch.backends.cuda.allow_tensor_float_32 = True
+
+
+# torch._inductor.config.triton.cudagraphs = True   # or False if capture causes overhead
+# torch._inductor.config.use_mixed_mm = True        # enables faster matmul codegen
+# torch._inductor.config.triton.cudagraphs = True
+# torch._inductor.config.triton.cudagraph_trees = True  # More aggressive cudagraph usage
+# torch._inductor.config.triton.autotune_pointwise = True
+# # torch._inductor.config.triton.dense_indexing = True
+# torch._inductor.config.triton.max_tiles = 8  # Increase tiling options
+# torch._inductor.config.aggressive_fusion = True
+# torch._inductor.config.pattern_matcher = True
+# torch._inductor.config.permute_fusion = True
+# torch._inductor.config.max_autotune = True
+# torch._inductor.config.max_autotune_gemm = True
+
+torch.set_num_threads(12)
+torch.set_num_interop_threads(2)
+
+# torch._inductor.config.autotune_in_subproc = True            # instead of exporting TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC
+# torch._inductor.config.autotune_multi_device = True          # mirrors TORCHINDUCTOR_AUTOTUNE_MULTI_DEVICE
+# # torch._inductor.config.max_autotune_gemm_search_space = "EXHAUSTIVE"
+
+
+
 import argparse
+import copy
 import json
 import logging
 import math
@@ -78,6 +114,19 @@ def patch_gpt(model, config):
             m.attn.c_proj = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size, **config.sparse_kwargs_out, bias=False)
 
 
+def _build_activation_probe_batch(batch, limit):
+    """Return a shallow copy of `batch` with tensors truncated along batch dim."""
+    if limit is None:
+        return batch
+    sliced = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.size(0) > limit:
+            sliced[key] = value[:limit]
+        else:
+            sliced[key] = value
+    return sliced
+
+
 logger = get_logger(__name__)
 
 # require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -85,31 +134,8 @@ logger = get_logger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.v8_api_enabled = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True # 
-torch.backends.cuda.allow_tensor_float_32 = True
 
-import torch._dynamo as dynamo
-dynamo.config.verbose = False
-dynamo.config.suppress_errors = True
-dynamo.config.assume_static_by_default = True  # if shapes rarely change
-dynamo.config.cache_size_limit = 64  # limit graph cache to avoid recompiles
-dynamo.config.guard_nn_modules = True  # avoids excess guards
-
-import torch._inductor as inductor
-inductor.config.triton.cudagraphs = True   # or False if capture causes overhead
-inductor.config.max_autotune = False       # skip exhaustive autotune when compile time matters
-inductor.config.use_mixed_mm = True        # enables faster matmul codegen
-
-
-# torch.set_num_threads(n)
-# torch.set_num_interop_threads(m)
-
+lora_rank = 128 // 2
 
 def main():
 
@@ -150,9 +176,9 @@ def main():
         "hf_path": None,
         "base_output_dir": "model-output",
 
-        "hidden_size": 1024,
+        "hidden_size": 2048,
         "depth": 12,
-        "n_head": 8,
+        "n_head": 16,
 
         "beta1": 0.9,
         "beta2": 0.98,
@@ -165,7 +191,8 @@ def main():
 
         "num_workers": 12,
         "enable_sparse_lr_multiplier": True,
-        "use_sparse_block_gain": True,
+        "permute_in_init_mode": "variance_matched",
+        "permute_out_init_mode": "variance_matched",
 
         "log_params_every_n": 100,
         "activation_sample_limit": 2,
@@ -173,54 +200,59 @@ def main():
         "activation_param_blacklist": ["bias", "gate"],
         "activation_clear_cuda_cache": True,
         "activation_force_python_gc": False,
+        "activation_probe_batch_size": 2,
 
-        "sparse": False,
+        "lr_mult_sparse": True,
+        "lr_mult_lora": True,
+
+        "sparse": True,
         "sparse_kwargs_up":dict(
             sparse_heads=8, 
             # permute_in_mode="lora", 
             permute_in_mode=None,
-            rank_in=64, 
+            rank_in=lora_rank,
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=64, 
-            init_mode="per_block_xavier"
-            # init_mode="global_xavier"
+            rank_out=lora_rank, 
+            # init_mode="per_block_xavier"
+            init_mode="global_xavier"
             ),
         "sparse_kwargs_down":dict(
             sparse_heads=8, 
             # permute_in_mode="lora", 
             permute_in_mode=None,
-            rank_in=64, 
+            rank_in=lora_rank, 
             permute_out_mode="lora", 
-            rank_out=64, 
-            init_mode="per_block_xavier"
-            # init_mode="global_xavier"
+            rank_out=lora_rank, 
+            # init_mode="per_block_xavier"
+            init_mode="global_xavier"
             ),
         "sparse_kwargs_qkv":dict(
             sparse_heads=8, 
             permute_in_mode="lora", 
-            rank_in=64, 
+            rank_in=lora_rank, 
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=64, 
-            init_mode="per_block_xavier"
-            # init_mode="global_xavier"
+            rank_out=lora_rank, 
+            # init_mode="per_block_xavier"
+            init_mode="global_xavier"
             ),
         "sparse_kwargs_out":dict(
             sparse_heads=8, 
             # permute_in_mode="lora", 
             permute_in_mode=None,
-            rank_in=64, 
+            rank_in=lora_rank, 
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=64, 
-            init_mode="per_block_xavier"
-            # init_mode="global_xavier"
+            rank_out=lora_rank, 
+            # init_mode="per_block_xavier"
+            init_mode="global_xavier"
             ),
     }
 
     for key in ("sparse_kwargs_up", "sparse_kwargs_down", "sparse_kwargs_qkv", "sparse_kwargs_out"):
-        args[key]["use_block_gain"] = args["use_sparse_block_gain"]
+        args[key].setdefault("permute_in_init_mode", args["permute_in_init_mode"])
+        args[key].setdefault("permute_out_init_mode", args["permute_out_init_mode"])
 
     config = AutoConfig.from_pretrained(
         args['model_name_or_path'],
@@ -375,8 +407,11 @@ def main():
 
 
     print("num parameters", sum(p.numel() for p in model.parameters()))
+    activation_probe_model = copy.deepcopy(model)
+    for param in activation_probe_model.parameters():
+        param.requires_grad_(False)
     model = model.to(accelerator.device)
-    activation_probe_model = model  # keep eager (uncompiled) reference for activation stats
+    activation_probe_model = activation_probe_model.to(accelerator.device)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -621,15 +656,30 @@ def main():
                 should_profile_stats = (completed_steps % args.log_params_every_n == 0)
                 
                 if should_profile_stats:
+                    state_dict = accelerator.unwrap_model(model).state_dict()
+                    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+                    activation_probe_model.load_state_dict(
+                        state_dict
+                    )
+                    activation_batch = _build_activation_probe_batch(
+                        batch, args.activation_probe_batch_size
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    activation_probe_model.to(accelerator.device, non_blocking=True)
+                    activation_probe_model.eval()
                     activation_context = param_tracker.activation_capture_context(activation_probe_model)
-                    with torch.no_grad():
-                        with accelerator.autocast():
-                            with activation_context:
-                                _ = activation_probe_model(**batch)
+                    with torch.inference_mode(), accelerator.autocast():
+                        with activation_context:
+                            _ = activation_probe_model(**activation_batch)
+                    # activation_probe_model.to("cpu", non_blocking=True)
+                    del activation_batch
                     # garbage collect
                     import gc
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     
                 
                 # Time forward pass

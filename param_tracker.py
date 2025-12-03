@@ -50,12 +50,12 @@ class _ActivationRunningStats:
             return None
         mean = self.sum / self.count
         second_moment = self.sum_sq / self.count
-        variance = max(second_moment - mean ** 2, 0.0)
-        std = math.sqrt(variance)
+        # variance = max(second_moment - mean ** 2, 0.0)
+        # std = math.sqrt(variance)
         return {
             # 'mean': mean,
-            'std': std,
-            # 'norm': math.sqrt(self.sum_sq),
+            # 'std': std,
+            'norm': math.sqrt(self.sum_sq / self.count),
             # 'zero_frac': self.near_zero / self.count,
         }
 
@@ -85,8 +85,8 @@ class ParameterTracker:
         self.activation_capture_locations = self._normalize_capture_locations(activation_capture)
         self.activation_stat_bases = (
             # 'mean',
-            'std',
-            # 'norm',
+            # 'std',
+            'norm',
             # 'zero_frac',
         )
         self.activation_stat_keys = [
@@ -103,11 +103,11 @@ class ParameterTracker:
             entry = {
                 'steps': [],
                 # 'param_mean': [],
-                'param_std': [],
-                # 'param_norm': [],
+                # 'param_std': [],
+                'param_norm': [],
                 # 'grad_mean': [],
-                'grad_std': [],
-                # 'grad_norm': [],
+                # 'grad_std': [],
+                'grad_norm': [],
                 'grad_to_param_ratio': [],
                 'grad_snr': [],
                 'grad_zero_frac': [],
@@ -309,12 +309,15 @@ class ParameterTracker:
             
             # Parameter statistics
             # param_mean = param.data.mean().item()
-            param_std = param.data.std().item()
+            # param_std = param.data.std().item()
+            param_numel = param.data.numel()
             param_norm = param.data.norm().item()
+            if param_numel > 0:
+                param_norm /= math.sqrt(param_numel)
             
             # history['param_mean'].append(param_mean)
-            history['param_std'].append(param_std)
-            # history['param_norm'].append(param_norm)
+            # history['param_std'].append(param_std)
+            history['param_norm'].append(param_norm)
             
             # Fraction of near-zero values
             near_zero = (param.data.abs() < self.near_zero_threshold).float().mean().item()
@@ -327,13 +330,16 @@ class ParameterTracker:
             # Gradient statistics
             if param.grad is not None:
                 grad_cpu = param.grad.detach().to(device="cpu", dtype=torch.float32)
+                grad_numel = grad_cpu.numel()
                 grad_mean = grad_cpu.mean().item()
                 grad_std = grad_cpu.std().item()
                 grad_norm = grad_cpu.norm().item()
+                if grad_numel > 0:
+                    grad_norm /= math.sqrt(grad_numel)
                 
                 # history['grad_mean'].append(grad_mean)
-                history['grad_std'].append(grad_std)
-                # history['grad_norm'].append(grad_norm)
+                # history['grad_std'].append(grad_std)
+                history['grad_norm'].append(grad_norm)
                 
                 # Gradient-to-parameter ratio
                 grad_to_param = grad_norm / (param_norm + 1e-8)
@@ -364,8 +370,8 @@ class ParameterTracker:
                 
             else:
                 # history['grad_mean'].append(0.0)
-                history['grad_std'].append(0.0)
-                # history['grad_norm'].append(0.0)
+                # history['grad_std'].append(0.0)
+                history['grad_norm'].append(0.0)
                 history['grad_to_param_ratio'].append(0.0)
                 history['grad_snr'].append(0.0)
                 history['grad_cosine'].append(0.0)
@@ -414,14 +420,15 @@ class ParameterTracker:
             
             # Log parameter statistics
             # log_dict[f'params/{clean_name}/mean'] = history['param_mean'][latest_idx]
-            log_dict[f'params/{clean_name}/std'] = history['param_std'][latest_idx]
-            # log_dict[f'params/{clean_name}/norm'] = history['param_norm'][latest_idx]
+            # log_dict[f'params/{clean_name}/std'] = history['param_std'][latest_idx]
+            log_dict[f'params/{clean_name}/norm'] = history['param_norm'][latest_idx]
             log_dict[f'params/{clean_name}/zero_frac'] = history['grad_zero_frac'][latest_idx]
             
             # Log gradient statistics
             # log_dict[f'grads/{clean_name}/mean'] = history['grad_mean'][latest_idx]
-            log_dict[f'grads/{clean_name}/std'] = history['grad_std'][latest_idx]
+            # log_dict[f'grads/{clean_name}/std'] = history['grad_std'][latest_idx]
             # log_dict[f'grads/{clean_name}/norm'] = history['grad_norm'][latest_idx]
+            log_dict[f'grads/{clean_name}/norm'] = history['grad_norm'][latest_idx]
             log_dict[f'grads/{clean_name}/to_param_ratio'] = history['grad_to_param_ratio'][latest_idx]
             log_dict[f'grads/{clean_name}/snr'] = history['grad_snr'][latest_idx]
             log_dict[f'grads/{clean_name}/cosine'] = history['grad_cosine'][latest_idx]

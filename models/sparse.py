@@ -19,33 +19,40 @@ class LoRAPermuter(nn.Module):
         invert_weights: bool = False,
         inverse_strategy: str = "woodbury",
         inverse_eps: float = 1e-6,
+        lora_init_mode: str = "variance_matched",
     ):
         super().__init__()
         self.lora_down = nn.Linear(dim, rank, bias=False)
-        self.lora_up = nn.Linear(rank, dim, bias=True)
+        self.lora_up = nn.Linear(rank, dim, bias=False)
         self.rank = rank
-        # self.layer_norm = nn.LayerNorm(dim)
         self.lr_mult = math.sqrt(dim / rank)
         setattr(self.lora_down.weight, "lr_mult", self.lr_mult)
         setattr(self.lora_up.weight, "lr_mult", self.lr_mult)
 
+        if lora_init_mode == "classic":
+            nn.init.normal_(self.lora_down.weight, mean=0.0, std=1.0 / self.rank)
+            nn.init.zeros_(self.lora_up.weight)
+        elif lora_init_mode == "variance_matched":
+            # Match the variance of a dense Linear(dim, dim) initialized with Xavier.
+            # For W = lora_up @ lora_down we need rank * Var(lora_up) * Var(lora_down) = 1 / dim.
+            target_var = 1.0 / dim  # same as Xavier for square weight matrices
+            down_std = 1.0 / math.sqrt(dim)  # keep down-projection well-scaled
+            nn.init.normal_(self.lora_down.weight, mean=0.0, std=down_std)
+            up_std = math.sqrt(target_var / (self.rank * down_std ** 2))
+            nn.init.normal_(self.lora_up.weight, mean=0.0, std=up_std)
+        else:
+            raise ValueError(f"Unknown lora_init_mode '{lora_init_mode}'")
 
-        # Match the variance of a dense Linear(dim, dim) initialized with Xavier.
-        # For W = lora_up @ lora_down we need rank * Var(lora_up) * Var(lora_down) = 1 / dim.
-        target_var = 1.0 / dim  # same as Xavier for square weight matrices
-        down_std = 1.0 / math.sqrt(dim)  # keep down-projection well-scaled
-        nn.init.normal_(self.lora_down.weight, mean=0.0, std=down_std)
-        up_std = math.sqrt(target_var / (self.rank * down_std ** 2))
-        nn.init.normal_(self.lora_up.weight, mean=0.0, std=up_std)
-
-        self.lora_up.bias.data.zero_()
+        if self.lora_up.bias is not None:
+            self.lora_up.bias.data.zero_()
+        if self.lora_down.bias is not None:
+            self.lora_down.bias.data.zero_()
 
         self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
         self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
 
-        # lr mult x 100 for gate
-        setattr(self.gate_x, "lr_mult", 50.0)
-        setattr(self.gate_lora, "lr_mult", 50.0)
+        setattr(self.gate_x, "lr_mult", 10.0)
+        setattr(self.gate_lora, "lr_mult", 10.0)
 
         if init_weights is not None:
             self._load_custom_weights(
@@ -57,10 +64,16 @@ class LoRAPermuter(nn.Module):
         elif invert_weights:
             raise ValueError("invert_weights=True requires init_weights to be provided.")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # delta = self.lora_up(self.lora_down(self.layer_norm(x)))
-        delta = self.lora_up(self.lora_down(x))
-        return delta * self.gate_lora + x * self.gate_x
+        self.forward_op = self.forward_var_match if lora_init_mode == "variance_matched" else self.forward_classic
+
+    def forward_var_match(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lora_up(self.lora_down(x)) * self.gate_lora + x * self.gate_x
+
+    def forward_classic(self, x: torch.Tensor):
+        return self.lora_up(self.lora_down(x)) + x
+
+    def forward(self, x: torch.Tensor):
+        return self.forward_op(x)
 
     def _load_custom_weights(
         self,
@@ -258,6 +271,8 @@ class SparseLinear(nn.Module):
         lora_alpha_in: Optional[float] = None,
         lora_alpha_out: Optional[float] = None,
         use_block_gain: bool = False,
+        permute_in_init_mode: str = "variance_matched",
+        permute_out_init_mode: str = "variance_matched",
     ):
         super(SparseLinear, self).__init__()
         self.full_in = full_in_dim
@@ -271,12 +286,14 @@ class SparseLinear(nn.Module):
         setattr(self.weight, "lr_mult", self.weight_lr_mult)
         self.bias_add = BiasAdd(self.full_out) if bias else nn.Identity()
 
-        # multiply weight by 0.5
-        self.weight.data *= 0.5
-
         if permute_in_mode == "lora":
             alpha_in = lora_alpha_in if lora_alpha_in is not None else rank_in
-            self.permute_in = LoRAPermuter(self.in_dim, rank_in, lora_alpha=alpha_in)
+            self.permute_in = LoRAPermuter(
+                self.full_in,
+                rank_in,
+                lora_alpha=alpha_in,
+                lora_init_mode=permute_in_init_mode,
+            )
         elif permute_in_mode is None:
             self.permute_in = nn.Identity()
         else:
@@ -284,7 +301,12 @@ class SparseLinear(nn.Module):
 
         if permute_out_mode == "lora":
             alpha_out = lora_alpha_out if lora_alpha_out is not None else rank_out
-            self.permute_out = LoRAPermuter(self.out_dim, rank_out, lora_alpha=alpha_out)
+            self.permute_out = LoRAPermuter(
+                self.full_out,
+                rank_out,
+                lora_alpha=alpha_out,
+                lora_init_mode=permute_out_init_mode,
+            )
         elif permute_out_mode == "unpermute":
             self.permute_out = Unpermute(self.permute_in.permute)
         elif permute_out_mode is None:
@@ -312,12 +334,6 @@ class SparseLinear(nn.Module):
             fan_out = self.full_out
             std = gain * math.sqrt(2.0 / (fan_in + fan_out))
             torch.nn.init.normal_(weight, mean=0.0, std=std)
-
-        elif init_mode == "masked_kaiming":
-            fan_in = self.in_dim  # each output sees only the inputs from its block
-            std = gain / math.sqrt(fan_in)
-            torch.nn.init.normal_(weight, mean=0.0, std=std)
-
         else:
             raise ValueError(f"Unknown init_mode: {init_mode}")
 
@@ -331,20 +347,14 @@ class SparseLinear(nn.Module):
         else:
             raise ValueError("SparseLinear expects input of shape (b, dim) or (b, seq, dim).")
 
-
-        x = x.reshape(b * tokens, self.h, self.in_dim)
-
-        # Apply the (optionally learnable) input permuter head-wise.
-        x = x.reshape(-1, self.in_dim)
         x = self.permute_in(x)
+
         x = x.reshape(b * tokens, self.h, self.in_dim)
 
         x = torch.einsum('bhd,hdl->bhl', x.float(), self.weight.float()).to(x.dtype)
 
-        # Apply the output permuter before stitching heads back together.
-        x = x.reshape(-1, self.out_dim)
-        x = self.permute_out(x)
         x = x.reshape(b, tokens, self.h * self.out_dim)
+        x = self.permute_out(x)
         x = self.bias_add(x)
         if tokens == 1:
             x = x.squeeze(1)
