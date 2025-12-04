@@ -99,7 +99,6 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 import time
 
 from models.sparse import SparseLinear
-from gptmodel import GPTConfig, GPT
 from param_tracker import ParameterTracker
 
 
@@ -205,8 +204,8 @@ def main():
         "lr_mult_gate": True,
         "lora_rank": 128 // 2,
         "sparse_heads": 8,
-        # "sparse_weight_init_mode": "per_block_xavier",
-        "sparse_weight_init_mode": "global_xavier",
+        "sparse_weight_init_mode": "per_block_xavier",
+        # "sparse_weight_init_mode": "global_xavier",
         # "permute_init_mode": "classic",
         "permute_init_mode": "variance_matched",
 

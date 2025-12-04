@@ -48,11 +48,15 @@ class LoRAPermuter(nn.Module):
             # self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
             # self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
 
-            self.gate = nn.Parameter(torch.ones(1) * 1.9)
 
             # if lr_mult_gate:    
             #     setattr(self.gate_x, "lr_mult", 10.0)
             #     setattr(self.gate_lora, "lr_mult", 10.0)
+
+            self.gate = nn.Parameter(torch.ones(1) * 1.9)
+
+            if lr_mult_gate:
+                setattr(self.gate, "lr_mult", 100.0)
         else:
             raise ValueError(f"Unknown lora_init_mode '{lora_init_mode}'")
 
