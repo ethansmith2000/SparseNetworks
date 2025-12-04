@@ -21,6 +21,34 @@ Here is the full list of checkpoints on the hub that can be fine-tuned by this s
 https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+import os
+import tempfile
+import inspect as _inspect
+
+# Make Triton and TorchInductor use stable, user-writable cache/tmp dirs on the cluster
+os.environ.setdefault("TRITON_CACHE_DIR", "/home/ethan/.triton/cache")
+os.environ.setdefault("TMPDIR", "/home/ethan/tmp")
+tempfile.tempdir = os.environ["TMPDIR"]
+
+
+def _safe_getsourcelines(obj):
+    """
+    Work around Triton+Python 3.11 \"source code not available\" issues by
+    returning a dummy source snippet instead of raising, so torch.compile
+    can proceed. This is only meant for tooling and does not affect numerics.
+    """
+    try:
+        return _inspect._orig_getsourcelines(obj)  # type: ignore[attr-defined]
+    except OSError as e:
+        if "source code not available" in str(e):
+            return ["# source code not available\n"], 0
+        raise
+
+
+if not hasattr(_inspect, "_orig_getsourcelines"):
+    _inspect._orig_getsourcelines = _inspect.getsourcelines  # type: ignore[attr-defined]
+    _inspect.getsourcelines = _safe_getsourcelines
+
 
 import torch
 
@@ -31,7 +59,7 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.v8_api_enabled = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True # 
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False  # 
 torch.backends.cuda.allow_tensor_float_32 = True
 
 
@@ -101,16 +129,64 @@ import time
 from models.sparse import SparseLinear
 from param_tracker import ParameterTracker
 
+from transformers.models.gpt2 import modeling_gpt2 as gpt2_modeling
+from transformers import modeling_utils as hf_modeling_utils
+
+import torch._dynamo as torch_dynamo
+
+logger = get_logger(__name__)
+
+# Work around torch.compile limitation: tell torch._dynamo which *callables* are safe to ignore,
+# including HuggingFace module-level `logger.warning_once` usages in GPT2 and shared modeling_utils.
+try:
+    if hasattr(torch_dynamo.config, "ignore_logger_methods"):
+        current = getattr(torch_dynamo.config, "ignore_logger_methods", set())
+        # Start from any existing callable entries, drop non-callables that may have been added earlier.
+        safe_methods = {fn for fn in current if callable(fn)}
+
+        # Generic logging.Logger methods (ignore all instances)
+        safe_methods.update(
+            {
+                logging.Logger.debug,
+                logging.Logger.info,
+                logging.Logger.warning,
+                logging.Logger.error,
+                logging.Logger.exception,
+                logging.Logger.critical,
+                logging.Logger.log,
+                logging.Logger.warning_once,
+            }
+        )
+
+        # Specific HF GPT2 logger.warning_once (module-level logger in modeling_gpt2)
+        hf_gpt2_logger = getattr(gpt2_modeling, "logger", None)
+        if hf_gpt2_logger is not None:
+            gpt2_warning_once = getattr(hf_gpt2_logger, "warning_once", None)
+            if callable(gpt2_warning_once):
+                safe_methods.add(gpt2_warning_once)
+
+        # Shared transformers modeling_utils logger.warning_once (used by many models)
+        hf_shared_logger = getattr(hf_modeling_utils, "logger", None)
+        if hf_shared_logger is not None:
+            shared_warning_once = getattr(hf_shared_logger, "warning_once", None)
+            if callable(shared_warning_once):
+                safe_methods.add(shared_warning_once)
+
+        torch_dynamo.config.ignore_logger_methods = safe_methods
+except Exception:
+    # If anything goes wrong, fall back silently – this only impacts compile-mode logging behavior
+    pass
+
 
 
 def patch_gpt(model, config):
     for n,m in model.named_modules():
         if hasattr(m, "mlp"):
-            m.mlp.c_fc = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*4, **config.sparse_kwargs_up, bias=False)
-            m.mlp.c_proj = SparseLinear(full_in_dim=config.hidden_size*4, full_out_dim=config.hidden_size, **config.sparse_kwargs_down, bias=False)
+            m.mlp.c_fc = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*4, **config.sparse_kwargs_up, bias=True)
+            m.mlp.c_proj = SparseLinear(full_in_dim=config.hidden_size*4, full_out_dim=config.hidden_size, **config.sparse_kwargs_down, bias=True)
         if hasattr(m, "attn"):
-            m.attn.c_attn = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*3, **config.sparse_kwargs_qkv, bias=False)
-            m.attn.c_proj = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size, **config.sparse_kwargs_out, bias=False)
+            m.attn.c_attn = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size*3, **config.sparse_kwargs_qkv, bias=True)
+            m.attn.c_proj = SparseLinear(full_in_dim=config.hidden_size, full_out_dim=config.hidden_size, **config.sparse_kwargs_out, bias=True)
 
 
 def _build_activation_probe_batch(batch, limit):
@@ -136,9 +212,20 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def main():
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--override_json",
+        type=str,
+        default=None,
+        help="Optional path to a JSON file whose keys override the default args dict.",
+    )
+    cli_args = parser.parse_args()
+
     args = {
         "num_validation_batches": 25,
         "validate_every": 1000,
+        # "dataset_name": "openwebtext",
+        # "dataset_config_name": None,
         "dataset_name": "wikitext",
         "dataset_config_name": "wikitext-103-v1",
         "train_file": None,
@@ -149,10 +236,10 @@ def main():
         "config_name": None,
         "tokenizer_name": None,
         "use_slow_tokenizer": False,
-        "per_device_train_batch_size": 24,
-        "learning_rate": 7.0e-5,
+        "per_device_train_batch_size": 32,
+        "learning_rate": 1.0e-4,
         "weight_decay": 0.01,
-        "num_train_epochs": 2,
+        "num_train_epochs": 4,
         "max_train_steps": None,
         "gradient_accumulation_steps": 1,
         "lr_scheduler_type": "linear",
@@ -177,7 +264,7 @@ def main():
         "beta1": 0.9,
         "beta2": 0.98,
 
-        "compile": True,
+        "compile": False,
         "compile_mode": "reduce-overhead",
         "compile_fullgraph": True,
 
@@ -209,6 +296,7 @@ def main():
         # "permute_init_mode": "classic",
         "permute_init_mode": "variance_matched",
 
+        "down_permute_in_mode": None,
 
         "sparse": True,
         "sparse_kwargs_up":dict(
@@ -235,6 +323,13 @@ def main():
             ),
     }
 
+    # Optional overrides from a JSON file for sweep scripts or manual runs
+    if cli_args.override_json is not None:
+        with open(cli_args.override_json, "r") as f:
+            json_overrides = json.load(f)
+        # Shallow override: top-level keys in the JSON replace entries in args
+        args.update(json_overrides)
+
     for key in ("sparse_kwargs_up", "sparse_kwargs_down", "sparse_kwargs_qkv", "sparse_kwargs_out"):
         args[key].setdefault("lr_mult_sparse", args["lr_mult_sparse"])
         args[key].setdefault("lr_mult_lora", args["lr_mult_lora"])
@@ -245,6 +340,10 @@ def main():
         args[key].setdefault("rank_out", args["lora_rank"])
         args[key].setdefault("permute_in_init_mode", args["permute_init_mode"])
         args[key].setdefault("permute_out_init_mode", args["permute_init_mode"])
+
+    # Allow overriding the `permute_in_mode` only for the "down" sparse block
+    for key in ("sparse_kwargs_down",):
+        args[key].setdefault("permute_in_mode", args["down_permute_in_mode"])
 
 
     config = AutoConfig.from_pretrained(
@@ -263,7 +362,7 @@ def main():
     if args["sparse"]:
         base_str = f"sparse-{args['hidden_size']}"
         sparse_init = args["sparse_weight_init_mode"]
-        permute_init = args["permute_init_mode"]
+        permute_init = "var_match" if args["permute_init_mode"] == "variance_matched" else args["permute_init_mode"]
         sparse_heads = args["sparse_heads"]
         lora_rank = args["lora_rank"]
         bool_to_tag = lambda flag: "on" if flag else "off"
@@ -274,9 +373,10 @@ def main():
                 f"pInt-{permute_init}",
                 f"hds-{sparse_heads}",
                 f"rnk-{lora_rank}",
-                f"lrSprs-{bool_to_tag(args['lr_mult_sparse'])}",
-                f"lrLra-{bool_to_tag(args['lr_mult_lora'])}",
-                f"lrGte-{bool_to_tag(args['lr_mult_gate'])}",
+                f"dw-{args['down_permute_in_mode']}",
+                # f"lrSprs-{bool_to_tag(args['lr_mult_sparse'])}",
+                # f"lrLra-{bool_to_tag(args['lr_mult_lora'])}",
+                # f"lrGte-{bool_to_tag(args['lr_mult_gate'])}",
             ]
         )
         wandb_run_name = f"{base_str}-{wandb_suffix}"

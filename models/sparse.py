@@ -44,19 +44,13 @@ class LoRAPermuter(nn.Module):
             up_std = math.sqrt(target_var / (self.rank * down_std ** 2))
             nn.init.normal_(self.lora_up.weight, mean=0.0, std=up_std)
 
+            self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
+            self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
 
-            # self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
-            # self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
+            if lr_mult_gate:    
+                setattr(self.gate_x, "lr_mult", 10.0)
+                setattr(self.gate_lora, "lr_mult", 10.0)
 
-
-            # if lr_mult_gate:    
-            #     setattr(self.gate_x, "lr_mult", 10.0)
-            #     setattr(self.gate_lora, "lr_mult", 10.0)
-
-            self.gate = nn.Parameter(torch.ones(1) * 1.9)
-
-            if lr_mult_gate:
-                setattr(self.gate, "lr_mult", 100.0)
         else:
             raise ValueError(f"Unknown lora_init_mode '{lora_init_mode}'")
 
@@ -65,152 +59,16 @@ class LoRAPermuter(nn.Module):
         if self.lora_down.bias is not None:
             self.lora_down.bias.data.zero_()
 
-        if init_weights is not None:
-            self._load_custom_weights(
-                init_weights,
-                invert_weights=invert_weights,
-                inverse_strategy=inverse_strategy,
-                inverse_eps=inverse_eps,
-            )
-        elif invert_weights:
-            raise ValueError("invert_weights=True requires init_weights to be provided.")
-
         self.forward_op = self.forward_var_match if lora_init_mode == "variance_matched" else self.forward_classic
 
     def forward_var_match(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate.sigmoid()
-        return self.lora_up(self.lora_down(x)) * (1 - gate) + x * gate
+        return self.lora_up(self.lora_down(x)) * self.gate_lora.clamp(min=0, max=1) + x * self.gate_x.clamp(min=0, max=1)
 
     def forward_classic(self, x: torch.Tensor):
         return self.lora_up(self.lora_down(x)) + x
 
     def forward(self, x: torch.Tensor):
         return self.forward_op(x)
-
-    def _load_custom_weights(
-        self,
-        weights_cfg,
-        *,
-        invert_weights: bool,
-        inverse_strategy: str,
-        inverse_eps: float,
-    ) -> None:
-        """
-        Load external weights into the LoRA stack.
-        weights_cfg can be a dict with tensors/arrays or another LoRAPermuter.
-        """
-        if isinstance(weights_cfg, LoRAPermuter):
-            weights = {
-                "down": weights_cfg.lora_down.weight.data.detach().clone(),
-                "up": weights_cfg.lora_up.weight.data.detach().clone(),
-                "gate1": weights_cfg.gate1.data.detach().clone(),
-                "gate2": weights_cfg.gate2.data.detach().clone(),
-                "scaling": weights_cfg.scaling,
-            }
-        else:
-            weights = weights_cfg
-
-        required_keys = ("down", "up")
-        for key in required_keys:
-            if key not in weights:
-                raise ValueError(f"Custom LoRA weights require '{key}' to be provided.")
-
-        device = self.lora_down.weight.device
-        dtype = self.lora_down.weight.dtype
-
-        def _as_tensor(value, shape):
-            tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-            tensor = tensor.to(device=device, dtype=dtype)
-            if tensor.shape != shape:
-                raise ValueError(f"Expected shape {shape} for custom weight, got {tensor.shape}.")
-            return tensor
-
-        down = _as_tensor(weights["down"], self.lora_down.weight.shape)
-        up = _as_tensor(weights["up"], self.lora_up.weight.shape)
-
-        if invert_weights:
-            up, down = self._compute_inverse_weights(
-                up,
-                down,
-                strategy=inverse_strategy,
-                eps=inverse_eps,
-            )
-            # Ensure the residual path stays identity when acting as an inverse.
-            self.gate1.data.fill_(1.0)
-            self.gate2.data.fill_(1.0)
-            self.scaling = 1.0
-
-        self.lora_down.weight.data.copy_(down)
-        self.lora_up.weight.data.copy_(up)
-
-        if "gate1" in weights:
-            self.gate1.data.copy_(_as_tensor(weights["gate1"], self.gate1.data.shape))
-        if "gate2" in weights:
-            self.gate2.data.copy_(_as_tensor(weights["gate2"], self.gate2.data.shape))
-        if "bias" in weights:
-            self.lora_up.bias.data.copy_(_as_tensor(weights["bias"], self.lora_up.bias.data.shape))
-        if "scaling" in weights:
-            self.scaling = float(weights["scaling"])
-
-    def _compute_inverse_weights(
-        self,
-        up: torch.Tensor,
-        down: torch.Tensor,
-        *,
-        strategy: str,
-        eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Produce a low-rank inverse using either a Woodbury-style update or a pseudoinverse.
-        Returns (up_tensor, down_tensor) suitable for assigning back into LoRA layers.
-        """
-        rank = self.rank
-        eye = torch.eye(rank, device=up.device, dtype=up.dtype)
-
-        if strategy == "woodbury":
-            vu = down @ up  # (rank x rank)
-            mat = eye + vu
-            mat_inv = torch.linalg.solve(mat, eye)
-            up_inv = -up @ mat_inv
-            down_inv = down
-        elif strategy == "pseudoinverse":
-            gram_v = down @ down.transpose(0, 1) + eps * eye
-            gram_u = up.transpose(0, 1) @ up + eps * eye
-            gram_v_inv = torch.linalg.solve(gram_v, eye)
-            gram_u_inv = torch.linalg.solve(gram_u, eye)
-            v_pinv = down.transpose(0, 1) @ gram_v_inv
-            u_pinv = gram_u_inv @ up.transpose(0, 1)
-            up_inv = v_pinv  # shape (dim, rank)
-            down_inv = u_pinv  # shape (rank, dim)
-        elif strategy == "svd":
-            up_inv, down_inv = self._svd_inverse(up, down, eps=eps)
-        else:
-            raise ValueError(f"Unknown inverse strategy '{strategy}'.")
-
-        return up_inv.contiguous(), down_inv.contiguous()
-
-    def _svd_inverse(
-        self,
-        up: torch.Tensor,
-        down: torch.Tensor,
-        *,
-        eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build an inverse by computing a low-rank SVD without materializing the dense matrix.
-        """
-        q_up, r_up = torch.linalg.qr(up, mode="reduced")
-        q_down_t, r_down_t = torch.linalg.qr(down.transpose(0, 1), mode="reduced")
-        s_mat = r_up @ r_down_t.transpose(0, 1)
-        u_s, sigma, vh_s = torch.linalg.svd(s_mat, full_matrices=False)
-        sigma = sigma.clamp_min(eps)
-        left_basis = q_up @ u_s
-        right_basis = q_down_t @ vh_s.transpose(0, 1)
-
-        sigma_inv_sqrt = sigma.rsqrt()
-        up_inv = right_basis * sigma_inv_sqrt.unsqueeze(0)
-        down_inv = sigma_inv_sqrt.unsqueeze(1) * left_basis.transpose(0, 1)
-        return up_inv, down_inv
 
 class Permute(nn.Module):
 
