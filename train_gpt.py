@@ -135,8 +135,6 @@ MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
-lora_rank = 128 // 2
-
 def main():
 
     args = {
@@ -176,9 +174,6 @@ def main():
         "hf_path": None,
         "base_output_dir": "model-output",
 
-        "hidden_size": 2048,
-        "depth": 12,
-        "n_head": 16,
 
         "beta1": 0.9,
         "beta2": 0.98,
@@ -190,9 +185,6 @@ def main():
         "gradient_checkpointing": True,
 
         "num_workers": 12,
-        "enable_sparse_lr_multiplier": True,
-        "permute_in_init_mode": "variance_matched",
-        "permute_out_init_mode": "variance_matched",
 
         "log_params_every_n": 100,
         "activation_sample_limit": 2,
@@ -202,57 +194,59 @@ def main():
         "activation_force_python_gc": False,
         "activation_probe_batch_size": 2,
 
+        # model parameters
+        "hidden_size": 2048,
+        "depth": 12,
+        "n_head": 16,
+
+        # sparse and lora parameters
         "lr_mult_sparse": True,
         "lr_mult_lora": True,
+        "lr_mult_gate": True,
+        "lora_rank": 128 // 2,
+        "sparse_heads": 8,
+        # "sparse_weight_init_mode": "per_block_xavier",
+        "sparse_weight_init_mode": "global_xavier",
+        # "permute_init_mode": "classic",
+        "permute_init_mode": "variance_matched",
+
 
         "sparse": True,
         "sparse_kwargs_up":dict(
-            sparse_heads=8, 
-            # permute_in_mode="lora", 
-            permute_in_mode=None,
-            rank_in=lora_rank,
+            permute_in_mode="lora", 
+            # permute_in_mode=None,
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=lora_rank, 
-            # init_mode="per_block_xavier"
-            init_mode="global_xavier"
             ),
         "sparse_kwargs_down":dict(
-            sparse_heads=8, 
             # permute_in_mode="lora", 
             permute_in_mode=None,
-            rank_in=lora_rank, 
             permute_out_mode="lora", 
-            rank_out=lora_rank, 
-            # init_mode="per_block_xavier"
-            init_mode="global_xavier"
             ),
         "sparse_kwargs_qkv":dict(
-            sparse_heads=8, 
             permute_in_mode="lora", 
-            rank_in=lora_rank, 
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=lora_rank, 
-            # init_mode="per_block_xavier"
-            init_mode="global_xavier"
             ),
         "sparse_kwargs_out":dict(
-            sparse_heads=8, 
-            # permute_in_mode="lora", 
-            permute_in_mode=None,
-            rank_in=lora_rank, 
+            permute_in_mode="lora", 
+            # permute_in_mode=None,
             permute_out_mode="lora", 
             # permute_out_mode=None,
-            rank_out=lora_rank, 
-            # init_mode="per_block_xavier"
-            init_mode="global_xavier"
             ),
     }
 
     for key in ("sparse_kwargs_up", "sparse_kwargs_down", "sparse_kwargs_qkv", "sparse_kwargs_out"):
-        args[key].setdefault("permute_in_init_mode", args["permute_in_init_mode"])
-        args[key].setdefault("permute_out_init_mode", args["permute_out_init_mode"])
+        args[key].setdefault("lr_mult_sparse", args["lr_mult_sparse"])
+        args[key].setdefault("lr_mult_lora", args["lr_mult_lora"])
+        args[key].setdefault("lr_mult_gate", args["lr_mult_gate"])
+        args[key].setdefault("sparse_heads", args["sparse_heads"])
+        args[key].setdefault("init_mode", args["sparse_weight_init_mode"])
+        args[key].setdefault("rank_in", args["lora_rank"])
+        args[key].setdefault("rank_out", args["lora_rank"])
+        args[key].setdefault("permute_in_init_mode", args["permute_init_mode"])
+        args[key].setdefault("permute_out_init_mode", args["permute_init_mode"])
+
 
     config = AutoConfig.from_pretrained(
         args['model_name_or_path'],
@@ -265,8 +259,30 @@ def main():
     config.n_layer = args['depth']
     config.n_head = args['n_head']
 
-    base_str = f"base_hid-{args['hidden_size']}"
+    base_str = f"base-{args['hidden_size']}"
+    wandb_run_name = base_str
+    if args["sparse"]:
+        base_str = f"sparse-{args['hidden_size']}"
+        sparse_init = args["sparse_weight_init_mode"]
+        permute_init = args["permute_init_mode"]
+        sparse_heads = args["sparse_heads"]
+        lora_rank = args["lora_rank"]
+        bool_to_tag = lambda flag: "on" if flag else "off"
+        sparse_init = "pbx" if sparse_init == "per_block_xavier" else "gx"
+        wandb_suffix = "-".join(
+            [
+                f"wInt-{sparse_init}",
+                f"pInt-{permute_init}",
+                f"hds-{sparse_heads}",
+                f"rnk-{lora_rank}",
+                f"lrSprs-{bool_to_tag(args['lr_mult_sparse'])}",
+                f"lrLra-{bool_to_tag(args['lr_mult_lora'])}",
+                f"lrGte-{bool_to_tag(args['lr_mult_gate'])}",
+            ]
+        )
+        wandb_run_name = f"{base_str}-{wandb_suffix}"
     args["output_dir"] = f"{args['base_output_dir']}/{base_str}"
+    args["wandb_run_name"] = wandb_run_name
 
     args = SimpleNamespace(**args)
 
@@ -504,7 +520,7 @@ def main():
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        lr_mult = getattr(param, "lr_mult", 1.0) if args.enable_sparse_lr_multiplier else 1.0
+        lr_mult = getattr(param, "lr_mult", 1.0)
         optimizer_grouped_parameters.append(
             {
                 "params": [param],
@@ -559,10 +575,9 @@ def main():
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"]
         init_kwargs = {
-            "wandb":
-                {
-                    "name": f"{base_str}",
-                }
+            "wandb": {
+                "name": args.wandb_run_name,
+            }
         }
         accelerator.init_trackers("clm_no_trainer", experiment_config, init_kwargs=init_kwargs)
         # accelerator.init_trackers("sparse_gpt", experiment_config, init_kwargs=init_kwargs)

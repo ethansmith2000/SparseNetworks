@@ -34,7 +34,8 @@ class _ActivationRunningStats:
             tensor = tensor[: self.sample_limit]
         # Move to CPU before computing stats so large activation buffers
         # do not accumulate on GPU and trigger fragmented cache growth.
-        tensor = tensor.to(device="cpu", dtype=torch.float32)
+        # tensor = tensor.to(device="cpu", dtype=torch.float32)
+        tensor = tensor.float()
         numel = tensor.numel()
         if numel == 0:
             return
@@ -329,11 +330,11 @@ class ParameterTracker:
             
             # Gradient statistics
             if param.grad is not None:
-                grad_cpu = param.grad.detach().to(device="cpu", dtype=torch.float32)
-                grad_numel = grad_cpu.numel()
-                grad_mean = grad_cpu.mean().item()
-                grad_std = grad_cpu.std().item()
-                grad_norm = grad_cpu.norm().item()
+                grad_tensor = param.grad.detach().float()
+                grad_numel = grad_tensor.numel()
+                grad_mean = grad_tensor.mean().item()
+                grad_std = grad_tensor.std().item()
+                grad_norm = grad_tensor.norm().item()
                 if grad_numel > 0:
                     grad_norm /= math.sqrt(grad_numel)
                 
@@ -350,7 +351,7 @@ class ParameterTracker:
                 history['grad_snr'].append(grad_snr)
                 
                 # Gradient direction stability (cosine similarity with previous gradient)
-                grad_flat = grad_cpu.view(-1)
+                grad_flat = grad_tensor.view(-1)
                 if name in self.prev_grads:
                     prev_grad_flat = self.prev_grads[name]
                     # Compute cosine similarity on CPU to avoid holding GPU buffers

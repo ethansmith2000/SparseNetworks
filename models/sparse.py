@@ -20,14 +20,17 @@ class LoRAPermuter(nn.Module):
         inverse_strategy: str = "woodbury",
         inverse_eps: float = 1e-6,
         lora_init_mode: str = "variance_matched",
+        lr_mult_lora: bool = False,
+        lr_mult_gate: bool = False,
     ):
         super().__init__()
         self.lora_down = nn.Linear(dim, rank, bias=False)
         self.lora_up = nn.Linear(rank, dim, bias=False)
         self.rank = rank
         self.lr_mult = math.sqrt(dim / rank)
-        setattr(self.lora_down.weight, "lr_mult", self.lr_mult)
-        setattr(self.lora_up.weight, "lr_mult", self.lr_mult)
+        if lr_mult_lora:
+            setattr(self.lora_down.weight, "lr_mult", self.lr_mult)
+            setattr(self.lora_up.weight, "lr_mult", self.lr_mult)
 
         if lora_init_mode == "classic":
             nn.init.normal_(self.lora_down.weight, mean=0.0, std=1.0 / self.rank)
@@ -40,6 +43,16 @@ class LoRAPermuter(nn.Module):
             nn.init.normal_(self.lora_down.weight, mean=0.0, std=down_std)
             up_std = math.sqrt(target_var / (self.rank * down_std ** 2))
             nn.init.normal_(self.lora_up.weight, mean=0.0, std=up_std)
+
+
+            # self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
+            # self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
+
+            self.gate = nn.Parameter(torch.ones(1) * 1.9)
+
+            # if lr_mult_gate:    
+            #     setattr(self.gate_x, "lr_mult", 10.0)
+            #     setattr(self.gate_lora, "lr_mult", 10.0)
         else:
             raise ValueError(f"Unknown lora_init_mode '{lora_init_mode}'")
 
@@ -47,12 +60,6 @@ class LoRAPermuter(nn.Module):
             self.lora_up.bias.data.zero_()
         if self.lora_down.bias is not None:
             self.lora_down.bias.data.zero_()
-
-        self.gate_x = nn.Parameter(torch.ones(1) * 0.85)
-        self.gate_lora = nn.Parameter(torch.ones(1) * 0.15)
-
-        setattr(self.gate_x, "lr_mult", 10.0)
-        setattr(self.gate_lora, "lr_mult", 10.0)
 
         if init_weights is not None:
             self._load_custom_weights(
@@ -67,7 +74,8 @@ class LoRAPermuter(nn.Module):
         self.forward_op = self.forward_var_match if lora_init_mode == "variance_matched" else self.forward_classic
 
     def forward_var_match(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lora_up(self.lora_down(x)) * self.gate_lora + x * self.gate_x
+        gate = self.gate.sigmoid()
+        return self.lora_up(self.lora_down(x)) * (1 - gate) + x * gate
 
     def forward_classic(self, x: torch.Tensor):
         return self.lora_up(self.lora_down(x)) + x
@@ -273,6 +281,9 @@ class SparseLinear(nn.Module):
         use_block_gain: bool = False,
         permute_in_init_mode: str = "variance_matched",
         permute_out_init_mode: str = "variance_matched",
+        lr_mult_sparse: bool = True,
+        lr_mult_lora: bool = True,
+        lr_mult_gate: bool = True,
     ):
         super(SparseLinear, self).__init__()
         self.full_in = full_in_dim
@@ -283,7 +294,8 @@ class SparseLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.h, self.in_dim, self.out_dim))
         self._init_weight_tensor(init_mode, init_gain, structure_gains)
         self.weight_lr_mult = math.sqrt(self.full_in / self.in_dim)
-        setattr(self.weight, "lr_mult", self.weight_lr_mult)
+        if lr_mult_sparse:
+            setattr(self.weight, "lr_mult", self.weight_lr_mult)
         self.bias_add = BiasAdd(self.full_out) if bias else nn.Identity()
 
         if permute_in_mode == "lora":
@@ -293,6 +305,8 @@ class SparseLinear(nn.Module):
                 rank_in,
                 lora_alpha=alpha_in,
                 lora_init_mode=permute_in_init_mode,
+                lr_mult_lora=lr_mult_lora,
+                lr_mult_gate=lr_mult_gate,
             )
         elif permute_in_mode is None:
             self.permute_in = nn.Identity()
